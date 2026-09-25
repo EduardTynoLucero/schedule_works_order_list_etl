@@ -6,10 +6,6 @@ dist/
 build/
 coverage/
 
-# Variables de entorno
-.env
-.env.*
-!.env.example
 
 # Logs
 logs/
