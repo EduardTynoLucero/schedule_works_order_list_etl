@@ -13,6 +13,13 @@ function toBool(v: any, def = false) {
   return s === "1" || s === "true" || s === "yes" || s === "y";
 }
 
+// Acepta DB_PASS o DB_PASSWORD y permite contraseña vacía (MySQL local sin password).
+function dbPassword(): string {
+  const v = process.env.DB_PASS ?? process.env.DB_PASSWORD;
+  if (v === undefined) throw new Error("Missing env var: DB_PASS (o DB_PASSWORD)");
+  return v;
+}
+
 function toNum(v: any, def: number) {
   const n = Number(v);
   return Number.isFinite(n) ? n : def;
@@ -58,7 +65,7 @@ export const config = {
   db: {
     host: must("DB_HOST"),
     user: must("DB_USER"),
-    password: must("DB_PASS"),
+    password: dbPassword(),
     database: must("DB_NAME"),
     port: Number(process.env.DB_PORT ?? "3306"),
     // [RAM] limites del pool (ver src/db.ts)
