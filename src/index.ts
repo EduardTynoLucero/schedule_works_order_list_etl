@@ -1,4 +1,5 @@
 import { config } from "./config.js";
+import { closePool } from "./db.js";
 import { logger } from "./etl/common/logger.js";
 import { inExecutionWindow, todayMidnightISO } from "./etl/common/time.js";
 import { worksEtl } from "./etl/worksEtl.js";
@@ -47,8 +48,24 @@ async function mainLoop() {
   }
 }
 
+// [RAM] Cierre ordenado: libera las conexiones del pool al detener el proceso (pm2, docker, Ctrl+C).
+let stopping = false;
+async function shutdown(signal: string) {
+  if (stopping) return;
+  stopping = true;
+  logger.warn(`${signal} recibido. Cerrando pool de BD...`);
+  await closePool();
+  process.exit(0);
+}
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
 if (config.etl.runOnce) {
-  runOnce().catch((e) => logger.error("FATAL", e));
+  // [RAM] Al terminar se cierra el pool; si no, las conexiones quedan abiertas y el proceso
+  // nunca termina (si un programador de tareas lo lanza cada X minutos, se acumulan procesos).
+  runOnce()
+    .catch((e) => logger.error("FATAL", e))
+    .finally(() => closePool());
 } else {
   mainLoop().catch((e) => logger.error("FATAL", e));
 }

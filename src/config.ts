@@ -36,6 +36,13 @@ function toEtlMode(v: any): EtlMode {
   throw new Error(`Invalid ETL_MODE=${s}. Use AUTO, UPDATED_SINCE or PAGING_ONLY.`);
 }
 
+// Paginacion automatica: ya no hay pagina final ni tamaño de pagina quemados.
+for (const legacy of ["WORKS_PAGE_TO", "WORKS_PAGE_SIZE_STOP"]) {
+  if (process.env[legacy]) {
+    console.warn(`[WARN] ${legacy} ya no se usa: el ETL detecta solo cuantas paginas devuelve la API.`);
+  }
+}
+
 const etlMode = toEtlMode(process.env.ETL_MODE);
 const forcePagingOnly = etlMode === "PAGING_ONLY";
 const forceUpdatedSince = etlMode === "UPDATED_SINCE";
@@ -54,6 +61,10 @@ export const config = {
     password: must("DB_PASS"),
     database: must("DB_NAME"),
     port: Number(process.env.DB_PORT ?? "3306"),
+    // [RAM] limites del pool (ver src/db.ts)
+    poolLimit: Math.max(1, toNum(process.env.DB_POOL_LIMIT, 5)),
+    poolMaxIdle: Math.max(0, toNum(process.env.DB_POOL_MAX_IDLE, 2)),
+    maxPreparedStatements: Math.max(1, toNum(process.env.DB_MAX_PREPARED_STATEMENTS, 50)),
   },
   tz: process.env.TZ ?? "America/Guatemala",
   cronExpr: process.env.CRON_EXPR ?? "*/3 * * * *",
@@ -72,8 +83,6 @@ export const config = {
     works: {
       pagingOnly: forcePagingOnly ? true : forceUpdatedSince ? false : toBool(process.env.WORKS_PAGING_ONLY, false),
       pageFrom: toNum(process.env.WORKS_PAGE_FROM, 0),
-      pageTo: toNum(process.env.WORKS_PAGE_TO, 999999),
-      pageSizeStop: toNum(process.env.WORKS_PAGE_SIZE_STOP, 50),
       fetchDetailsWhenMissingPatient: toBool(process.env.WORKS_FETCH_DETAILS_WHEN_MISSING_PATIENT, false),
       detailConcurrency: toNum(process.env.WORKS_DETAIL_CONCURRENCY, 2),
       backfillMissingPatients: toBool(process.env.WORKS_BACKFILL_MISSING_PATIENTS, false),

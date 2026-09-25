@@ -1,4 +1,4 @@
-import { exec } from "../../db.js";
+import { execQuery } from "../../db.js";
 
 export async function bulkInsert(
   table: string,
@@ -17,6 +17,7 @@ export async function bulkInsert(
       INSERT INTO ${table} (${colsSql})
       VALUES ${chunk.map(() => placeholdersRow).join(",")}
     `;
-    await exec(sql, chunk.flat());
+    // [RAM] query (no prepared statement): el numero de filas cambia en cada lote
+    await execQuery(sql, chunk.flat());
   }
 }

@@ -7,7 +7,7 @@ import { withTx } from "./common/tx.js";
 import { SQL } from "./common/sql.js";
 import { config } from "../config.js";
 import { detectPageBase } from "./common/pageBase.js";
-import { fetchWorkDetail, fetchWorksPage } from "./api/worksApiClient.js";
+import { fetchWorkDetail, fetchWorksPage, fetchWorksPageWithMeta } from "./api/worksApiClient.js";
 import type { WorkItem } from "../types/worksApi.js";
 // [SPLIT] validaciones de clinicas/doctores (ahora los carga schedule_clinics_doctors_etl)
 import {
@@ -318,17 +318,17 @@ export async function worksEtl(updatedSince: string) {
   if (pagingOnly) base = await detectPageBase((p) => fetchWorksPage(p, null));
 
   const pageStart = pagingOnly ? (config.paging.works.pageFrom + base) : 0;
-  const pageMax   = pagingOnly ? (config.paging.works.pageTo + base) : 999999;
+  // sin pagina final quemada: la API indica cuando ya no hay mas
 
   logger.info(
-    `Works ETL: mode=${pagingOnly ? "PAGING_ONLY" : "UPDATED_SINCE"} base=${base} pages=${pageStart}..${pageMax} ` +
+    `Works ETL: mode=${pagingOnly ? "PAGING_ONLY" : "UPDATED_SINCE"} base=${base} pages=${pageStart}..auto ` +
     `softDeleteGlobal=${pagingOnly && config.deletes.worksSoftDelete}`
   );
 
   await backfillMissingPatientsFromDetails();
 
-  await paginate<WorkItem>(
-    async (page) => fetchWorksPage(page, sinceParam),
+  const pages = await paginate<WorkItem>(
+    async (page) => fetchWorksPageWithMeta(page, sinceParam),
     async (items, page) => {
       logger.info(`Works ETL: page=${page} items=${items.length}`);
       if (!items.length) return;
@@ -342,9 +342,7 @@ export async function worksEtl(updatedSince: string) {
     },
     {
       pageStart,
-      pageMax,
-      pageSizeStop: config.paging.works.pageSizeStop,
-      forceRange: pagingOnly, // snapshot: NO se corta por items<50
+      label: "Works ETL",
       delayMs: pagingOnly ? 150 : 0,
     }
   );
@@ -364,6 +362,8 @@ export async function worksEtl(updatedSince: string) {
       // Candado para no matar data si STG quedó incompleta
       if (stgCount < 80000) {
         logger.warn(`Works ETL: STG incompleta (${stgCount}). NO hago soft delete global.`);
+      } else if (!pages.complete) {
+        logger.warn(`Works ETL: paginacion incompleta (fin=${pages.stopReason}). NO hago soft delete global.`);
       } else {
         await conn.execute(SQL.softDeleteWorksMissingFromStg);
       }
