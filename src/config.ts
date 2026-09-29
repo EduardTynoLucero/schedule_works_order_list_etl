@@ -92,6 +92,9 @@ export const config = {
       pageFrom: toNum(process.env.WORKS_PAGE_FROM, 0),
       fetchDetailsWhenMissingPatient: toBool(process.env.WORKS_FETCH_DETAILS_WHEN_MISSING_PATIENT, false),
       detailConcurrency: toNum(process.env.WORKS_DETAIL_CONCURRENCY, 2),
+      // [ADAPTATIVO] 1 (default) = WORKS_DETAIL_CONCURRENCY es el MAXIMO: arranca en 8, sube sola mientras la API
+      // responde bien y baja a la mitad si responde 503/429/timeout. 0 = siempre fija en WORKS_DETAIL_CONCURRENCY
+      detailAdaptive: toBool(process.env.WORKS_DETAIL_ADAPTIVE, true),
       // [ENVIO] consultar SIEMPRE /works/{id}: status, status_name y fecha de envio (delivery_note_date) del detalle
       fetchDetailForDelivery: toBool(process.env.WORKS_FETCH_DETAIL_FOR_DELIVERY, true),
       // 0 (default) = consultar SIEMPRE el detalle de todas las ordenes; 1 = solo nuevas, cambiadas o abiertas

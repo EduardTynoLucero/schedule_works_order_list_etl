@@ -63,8 +63,18 @@ Por defecto consulta SIEMPRE el detalle de todas las ordenes (`WORKS_DETAIL_ONLY
 
 - Se piden `WORKS_PAGE_CONCURRENCY` (8) paginas del listado a la vez y se procesan varias paginas al mismo tiempo,
   sin pausa fija entre paginas (`WORKS_PAGE_DELAY_MS`=0).
-- `WORKS_DETAIL_CONCURRENCY` = consultas al detalle al mismo tiempo en toda la corrida (default en `.env`: 32).
+- `WORKS_DETAIL_CONCURRENCY` = MAXIMO de consultas al detalle al mismo tiempo en toda la corrida (default en `.env`: 32).
   Es lo que mas influye: tiempo aproximado = ordenes x latencia del detalle / concurrencia.
+- `WORKS_DETAIL_ADAPTIVE=1` (default): la concurrencia se ajusta sola para ir rapido sin saturar la API. Arranca en 8
+  y sube (rapido hasta la primera saturacion, luego de 1 en 1 y mas despacio cerca de donde se saturo antes), hasta
+  `WORKS_DETAIL_CONCURRENCY`. Deja de subir si la API empieza a responder el doble de lento que lo normal y baja al
+  70 % si responde 503/429 o se tarda demasiado (log `API saturada (status=503) -> concurrencia detalle 32 -> 22`).
+  `WORKS_DETAIL_ADAPTIVE=0` = concurrencia fija.
+- Si la API se satura (429/502/503/504, timeout) o no hay internet: pausa global (ninguna consulta sale) de 1 s,
+  luego 2, 4, 8, 16 y 20 s maximo si sigue saturada (log `API saturada o sin respuesta ...: todas las consultas
+  esperan Xs`), y cada consulta se reintenta SIN LIMITE de intentos hasta que la API responda. Solo se deja de
+  reintentar una consulta con 502/504/timeout que falla 10 veces mientras la API si responde a las demas (una orden
+  puntual con problema), para no trabar el ETL; esa orden conserva lo que ya tenia en la base de datos.
 - El detalle se guarda en `external_work_details` en lotes de `WORKS_DETAIL_SAVE_BATCH` (500), de uno en uno.
 - `WORKS_PARTIAL_UPSERT_EVERY_PAGES` (0): en PAGING_ONLY solo se aplica a `works` al final.
 - Cada 20 paginas: `Works ETL: progreso paginas=... ritmo=N ordenes/min latencia detalle promedio=Xs ...`.

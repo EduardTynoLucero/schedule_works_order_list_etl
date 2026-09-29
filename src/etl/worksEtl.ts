@@ -9,6 +9,7 @@ import { SQL } from "./common/sql.js";
 import { config } from "../config.js";
 import { detectPageBase } from "./common/pageBase.js";
 import { fetchWorkDetail, fetchWorksPage, fetchWorksPageWithMeta } from "./api/worksApiClient.js";
+import { apiPauseStats, onApiOverload, resetApiPauseStats } from "./common/http.js";
 import type { WorkItem } from "../types/worksApi.js";
 // [SPLIT] validaciones de clinicas/doctores (ahora los carga schedule_clinics_doctors_etl)
 import {
@@ -90,8 +91,92 @@ function createLimiter(max: number) {
   };
 }
 
+/**
+ * [ADAPTATIVO] Como createLimiter, pero el limite se ajusta solo segun como responde la API, para ir lo mas rapido
+ * posible SIN saturarla:
+ * - arranca en 8 (o menos si WORKS_DETAIL_CONCURRENCY es menor) y sube mientras las consultas salen bien, sin pasar
+ *   de WORKS_DETAIL_CONCURRENCY: rapido (se duplica cada vuelta) hasta la primera saturacion y despues de 1 en 1;
+ * - cerca del nivel en el que la API se saturo la ultima vez sube 4 veces mas despacio;
+ * - si bajo a menos de la mitad del maximo que llego a tener (p. ej. despues de una caida de la API) recupera rapido;
+ * - si la API empieza a responder el doble de lento que lo normal, deja de subir (la API esta llegando a su limite);
+ * - si la API responde saturada (429/502/503/504 o timeout) baja al 70 % (minimo 2). Solo cuentan las consultas
+ *   enviadas despues de la ultima bajada (las anteriores son de la misma rafaga) y como mucho una bajada por segundo.
+ * Con WORKS_DETAIL_ADAPTIVE=0 el limite queda fijo en WORKS_DETAIL_CONCURRENCY.
+ */
+function createAdaptiveLimiter(max: number, adaptive: boolean) {
+  const min = Math.min(2, max);
+  let limit = adaptive ? Math.min(max, 8) : max;
+  let active = 0;
+  let okStreak = 0;
+  let lastDropAt = 0;
+  let ceiling = Number.POSITIVE_INFINITY; // concurrencia con la que la API se saturo la ultima vez
+  let peak = limit; // concurrencia mas alta alcanzada en la corrida
+  let latencyAvg = 0; // promedio movil de la latencia de las consultas que salieron bien
+  let latencyBase = Number.POSITIVE_INFINITY; // mejor promedio visto (API sin carga)
+  let samples = 0;
+  const queue: Array<() => void> = [];
+  const next = () => {
+    while (active < limit && queue.length) {
+      active += 1;
+      queue.shift()!();
+    }
+  };
+  const onSuccess = (ms: number) => {
+    samples += 1;
+    latencyAvg = samples === 1 ? ms : latencyAvg * 0.9 + ms * 0.1;
+    if (samples >= 20) latencyBase = Math.min(latencyBase, latencyAvg);
+    if (!adaptive || limit >= max) return;
+    // la API ya responde el doble de lento que lo normal: no subir mas para no saturarla
+    if (samples >= 20 && latencyAvg > latencyBase * 2) {
+      okStreak = 0;
+      return;
+    }
+    okStreak += 1;
+    if (limit > ceiling) ceiling = Number.POSITIVE_INFINITY; // ya paso el nivel donde se saturo, sin problema
+    const needed = lastDropAt === 0 || limit < peak * 0.5 ? 1 : limit >= ceiling * 0.9 ? limit * 4 : limit;
+    if (okStreak >= needed) {
+      okStreak = 0;
+      limit += 1;
+      peak = Math.max(peak, limit);
+      next();
+    }
+  };
+  return {
+    run<T>(fn: () => Promise<T>): Promise<T> {
+      return new Promise<T>((resolve, reject) => {
+        queue.push(() => {
+          const t0 = Date.now();
+          fn()
+            .then((value) => {
+              onSuccess(Date.now() - t0);
+              resolve(value);
+            }, reject)
+            .finally(() => {
+              active -= 1;
+              next();
+            });
+        });
+        next();
+      });
+    },
+    overload(reason: string, sentAt: number) {
+      if (!adaptive) return;
+      okStreak = 0;
+      const now = Date.now();
+      if (limit <= min || sentAt < lastDropAt || now - lastDropAt < 1000) return;
+      lastDropAt = now;
+      const before = limit;
+      ceiling = before;
+      limit = Math.max(min, Math.floor(limit * 0.7));
+      logger.warn(`Works ETL: API saturada (${reason}) -> concurrencia detalle ${before} -> ${limit}`);
+    },
+    current: () => limit,
+  };
+}
+
 // consultas al detalle en toda la corrida (todas las paginas juntas) y guardado del detalle de a uno
-let detailLimiter = createLimiter(1);
+let detailLimiter = createAdaptiveLimiter(1, false);
+onApiOverload((reason, sentAt) => detailLimiter.overload(reason, sentAt));
 let persistLock = createLimiter(1);
 
 async function mapWithConcurrency<T, R>(
@@ -321,7 +406,7 @@ async function enrichWorksWithDetail(items: WorkItem[], page: number, stats: Det
 
     stats.motivos[p.reason] = (stats.motivos[p.reason] ?? 0) + 1;
     try {
-      const detail = await detailLimiter(async () => {
+      const detail = await detailLimiter.run(async () => {
         const t0 = Date.now();
         try {
           return await fetchWorkDetail(p.w.id);
@@ -500,7 +585,7 @@ async function backfillMissingPatientsFromDetails() {
     Math.max(1, config.paging.works.detailConcurrency),
     async ({ external_id }) => {
       try {
-        const detail = await fetchWorkDetail(external_id);
+        const detail = await detailLimiter.run(() => fetchWorkDetail(external_id));
         if (detail && patientName(detail)?.trim()) fetched += 1;
         return detail;
       } catch (err: any) {
@@ -558,7 +643,8 @@ function logProgress(stats: DetailStats, startedAt: number) {
       `ritmo=${Math.round(stats.ordenes / minutes)} ordenes/min ` +
       `detalles=${stats.consultados} fallidos=${stats.fallidos} ` +
       `latencia detalle promedio=${calls ? (stats.apiMs / calls / 1000).toFixed(2) : "0"}s ` +
-      `concurrencia detalle=${config.paging.works.detailConcurrency} ` +
+      `concurrencia detalle=${detailLimiter.current()}/${config.paging.works.detailConcurrency} ` +
+      `pausas por saturacion=${apiPauseStats().pausas} (${Math.round(apiPauseStats().pausadoMs / 1000)}s) ` +
       `tiempo guardando detalle=${Math.round(stats.dbSaveMs / 1000)}s`
   );
 }
@@ -567,9 +653,13 @@ export async function worksEtl(updatedSince: string) {
   logger.info("Works ETL (STG): start");
   const runStartedAt = Date.now();
   const detailStats = newDetailStats();
-  detailLimiter = createLimiter(Math.max(1, config.paging.works.detailConcurrency));
+  detailLimiter = createAdaptiveLimiter(
+    Math.max(1, config.paging.works.detailConcurrency),
+    config.paging.works.detailAdaptive
+  );
   persistLock = createLimiter(1);
   saveBuffer = [];
+  resetApiPauseStats();
 
   // [VELOCIDAD] varias paginas se procesan a la vez (detalle + staging) mientras llegan las siguientes
   const pageWorkers = Math.max(1, config.paging.works.pageConcurrency);
@@ -718,6 +808,8 @@ export async function worksEtl(updatedSince: string) {
       `guardados en external_work_details=${detailStats.guardados} sin cambios=${detailStats.omitidos} ` +
       `latencia detalle promedio=${detailStats.consultados + detailStats.fallidos ? (detailStats.apiMs / (detailStats.consultados + detailStats.fallidos) / 1000).toFixed(2) : "0"}s ` +
       `tiempo guardando detalle=${Math.round(detailStats.dbSaveMs / 1000)}s ` +
+      `concurrencia detalle final=${detailLimiter.current()}/${config.paging.works.detailConcurrency} ` +
+      `pausas por saturacion=${apiPauseStats().pausas} (${Math.round(apiPauseStats().pausadoMs / 1000)}s) ` +
       `tiempo total=${Math.round((Date.now() - runStartedAt) / 1000)}s`
   );
   logger.info("Works ETL (STG): done");
