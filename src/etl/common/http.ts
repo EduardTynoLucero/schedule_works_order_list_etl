@@ -28,7 +28,12 @@ function isRetryableHttpError(error: any) {
 
 // [VELOCIDAD] Reutiliza las conexiones a la API (keep-alive). En Node 18 (el que usa Dokploy/Nixpacks)
 // no viene activado por defecto y cada consulta abria una conexion HTTPS nueva (handshake TLS).
-const keepAlive = { keepAlive: true, maxSockets: 32, maxFreeSockets: 16 };
+// alcanza para todas las consultas simultaneas (paginas + detalles) sin hacer cola en el agente
+const maxSockets = Math.max(
+  64,
+  config.paging.works.detailConcurrency + config.paging.works.pageConcurrency + 8
+);
+const keepAlive = { keepAlive: true, maxSockets, maxFreeSockets: maxSockets };
 
 export const http = axios.create({
   baseURL: config.api.baseUrl,

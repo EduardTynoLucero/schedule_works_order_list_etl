@@ -94,8 +94,20 @@ export const config = {
       detailConcurrency: toNum(process.env.WORKS_DETAIL_CONCURRENCY, 2),
       // [ENVIO] consultar SIEMPRE /works/{id}: status, status_name y fecha de envio (delivery_note_date) del detalle
       fetchDetailForDelivery: toBool(process.env.WORKS_FETCH_DETAIL_FOR_DELIVERY, true),
-      // minutos sin volver a consultar la misma orden si su status en el listado no cambio (0 = siempre)
-      detailCacheMinutes: toNum(process.env.WORKS_DETAIL_CACHE_MINUTES, 0),
+      // 0 (default) = consultar SIEMPRE el detalle de todas las ordenes; 1 = solo nuevas, cambiadas o abiertas
+      detailOnlyChanged: toBool(process.env.WORKS_DETAIL_ONLY_CHANGED, false),
+      // ordenes abiertas (sin fecha de envio): volver a consultar su detalle como maximo cada N minutos
+      openRecheckMinutes: Math.max(0, toNum(process.env.WORKS_OPEN_RECHECK_MINUTES, 30)),
+      // paginas del listado pedidas a la vez
+      pageConcurrency: Math.max(1, toNum(process.env.WORKS_PAGE_CONCURRENCY, 8)),
+      // [VELOCIDAD] detalles que se juntan antes de guardarlos en external_work_details (una transaccion)
+      detailSaveBatch: Math.max(1, toNum(process.env.WORKS_DETAIL_SAVE_BATCH, 500)),
+      // pausa entre paginas (antes 150 ms fijos en PAGING_ONLY)
+      pageDelayMs: Math.max(0, toNum(process.env.WORKS_PAGE_DELAY_MS, 0)),
+      // PAGING_ONLY: aplicar a works cada N paginas (0 = solo al final)
+      partialUpsertEveryPages: Math.max(0, toNum(process.env.WORKS_PARTIAL_UPSERT_EVERY_PAGES, 0)),
+      // backfill de pacientes: no reintentar la misma orden antes de N horas
+      backfillRetryHours: Math.max(0, toNum(process.env.WORKS_BACKFILL_RETRY_HOURS, 6)),
       backfillMissingPatients: toBool(process.env.WORKS_BACKFILL_MISSING_PATIENTS, false),
       backfillMissingPatientsLimit: toNum(process.env.WORKS_BACKFILL_MISSING_PATIENTS_LIMIT, 500),
       // WORKS_FIND_EXTERNAL_ID: external_id a buscar (o varios separados por coma).

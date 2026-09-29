@@ -66,6 +66,34 @@ function needsWorkDetail(w: WorkItem) {
   return !patientName(w)?.trim();
 }
 
+/** [VELOCIDAD] Limita cuantas tareas corren a la vez (compartido entre paginas). */
+function createLimiter(max: number) {
+  let active = 0;
+  const queue: Array<() => void> = [];
+  const next = () => {
+    if (active >= max || !queue.length) return;
+    active += 1;
+    queue.shift()!();
+  };
+  return function run<T>(fn: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      queue.push(() => {
+        fn()
+          .then(resolve, reject)
+          .finally(() => {
+            active -= 1;
+            next();
+          });
+      });
+      next();
+    });
+  };
+}
+
+// consultas al detalle en toda la corrida (todas las paginas juntas) y guardado del detalle de a uno
+let detailLimiter = createLimiter(1);
+let persistLock = createLimiter(1);
+
 async function mapWithConcurrency<T, R>(
   items: T[],
   concurrency: number,
@@ -85,17 +113,22 @@ async function mapWithConcurrency<T, R>(
 }
 
 /* =====================================================================
- * [ENVIO] Siempre se consulta el detalle (/works/{id}) de cada orden del listado
+ * [ENVIO] Status y fecha de envio desde el detalle (/works/{id})
  * ---------------------------------------------------------------------
  * - works (padre): status y status_name del detalle, y estimated_delivery = delivery_note_date
  *   (fecha de envio; NULL si la orden aun no se envia). Las demas fechas son las del listado.
  *   Paciente, clinica y doctor del detalle solo si el listado no los trae.
  * - external_work_details (hijo): se guarda el detalle completo (tambien tareas, productos, tags y
  *   lotes) de las ordenes que ya existen en works. Las ordenes nuevas las crea el ETL de detalle.
- * - Si la consulta al detalle falla, la orden conserva el status y la fecha que ya tenia en works
- *   (no se usan los del listado); si es nueva, status del listado y fecha NULL.
- * - WORKS_DETAIL_CACHE_MINUTES > 0: no repite la consulta de la misma orden durante esos minutos si
- *   su status en el listado no cambio. 0 = siempre consulta.
+ *
+ * [VELOCIDAD] Con WORKS_DETAIL_ONLY_CHANGED=1 solo se consulta el detalle cuando puede haber cambiado:
+ *   - orden nueva (no esta en works) o sin fila en external_work_details
+ *   - su fila del listado cambio desde la ultima vuelta (status, fechas...)
+ *   - orden abierta (todavia sin fecha de envio): como maximo cada WORKS_OPEN_RECHECK_MINUTES
+ *   - sin paciente en el listado y todavia no se le consulto el detalle
+ * Las demas (ya enviadas y sin cambios) conservan el status y la fecha que ya tienen en works: ya
+ * salieron del detalle y no se usan los del listado.
+ * Con WORKS_DETAIL_ONLY_CHANGED=0 se consulta el detalle de todas las ordenes.
  * ===================================================================== */
 
 type WorkState = {
@@ -103,6 +136,8 @@ type WorkState = {
   status: string | null;
   statusName: string | null;
   estimatedDelivery: string | null;
+  hasDetail: boolean;
+  hasDelivery: boolean;
 };
 
 type DetailValues = {
@@ -111,27 +146,33 @@ type DetailValues = {
   deliveryNoteDate: string | null; // YYYY-MM-DD
 };
 
-type CachedDetail = DetailValues & { at: number; listStatus: string | null };
+// Ultima version vista de cada orden en el listado (en memoria; se pierde si el proceso reinicia).
+// at = cuando se consulto su detalle por ultima vez (0 = nunca en este proceso).
+const seenList = new Map<number, { sig: string; at: number }>();
 
-const detailCache = new Map<number, CachedDetail>();
+export type DetailStats = {
+  consultados: number;
+  fallidos: number;
+  guardados: number;
+  omitidos: number;
+  motivos: Record<string, number>;
+  apiMs: number; // suma de lo que tardo cada consulta al detalle
+  dbSaveMs: number; // tiempo guardando detalles en la BD
+  paginas: number;
+  ordenes: number;
+};
 
-function detailCacheMs() {
-  return Math.max(0, config.paging.works.detailCacheMinutes) * 60_000;
+export function newDetailStats(): DetailStats {
+  return { consultados: 0, fallidos: 0, guardados: 0, omitidos: 0, motivos: {}, apiMs: 0, dbSaveMs: 0, paginas: 0, ordenes: 0 };
 }
 
-function pruneDetailCache() {
-  const ttl = detailCacheMs();
-  if (!ttl) {
-    detailCache.clear();
-    return;
-  }
-  const minAt = Date.now() - ttl;
-  for (const [id, cached] of detailCache) {
-    if (cached.at < minAt) detailCache.delete(id);
-  }
+function listSignature(w: WorkItem) {
+  return [w.status, w.status_name, w.finish_date, w.estimated_delivery, w.accept_date]
+    .map((v) => String(v ?? ""))
+    .join("|");
 }
 
-/** Lo que ya hay en works para estas ordenes (work_id para guardar el detalle y valores actuales). */
+/** Lo que ya hay en works / external_work_details para estas ordenes. */
 async function loadWorksState(ids: number[]) {
   const state = new Map<number, WorkState>();
   if (!ids.length) return state;
@@ -143,13 +184,18 @@ async function loadWorksState(ids: number[]) {
       status: string | null;
       status_name: string | null;
       estimated_delivery: string | null;
+      has_detail: number;
+      has_delivery: number;
     }>
   >(
     `
-      SELECT work_id, external_id, status, status_name,
-             DATE_FORMAT(estimated_delivery, '%Y-%m-%d %H:%i:%s') AS estimated_delivery
-      FROM works
-      WHERE external_id IN (?)
+      SELECT w.work_id, w.external_id, w.status, w.status_name,
+             DATE_FORMAT(w.estimated_delivery, '%Y-%m-%d %H:%i:%s') AS estimated_delivery,
+             (d.work_external_id IS NOT NULL) AS has_detail,
+             (d.delivery_note_date IS NOT NULL) AS has_delivery
+      FROM works w
+      LEFT JOIN external_work_details d ON d.work_external_id = w.external_id
+      WHERE w.external_id IN (?)
     `,
     [ids]
   );
@@ -160,6 +206,8 @@ async function loadWorksState(ids: number[]) {
       status: cleanText(row.status),
       statusName: cleanText(row.status_name),
       estimatedDelivery: cleanText(row.estimated_delivery),
+      hasDetail: Number(row.has_detail) === 1,
+      hasDelivery: Number(row.has_delivery) === 1,
     });
   }
   return state;
@@ -201,7 +249,7 @@ function withDetailValues(w: WorkItem, values: DetailValues, detail?: WorkItem |
   return merged;
 }
 
-/** Si el detalle fallo: conservar lo que ya hay en works (el status y la fecha del listado no sirven). */
+/** Sin detalle nuevo: conservar lo que ya hay en works (el status y la fecha del listado no sirven). */
 function withCurrentValues(w: WorkItem, current?: WorkState): WorkItem {
   if (!current) return { ...w, estimated_delivery: null };
   return {
@@ -212,82 +260,111 @@ function withCurrentValues(w: WorkItem, current?: WorkState): WorkItem {
   };
 }
 
-async function enrichWorksWithDetail(items: WorkItem[], page: number) {
-  const always = config.paging.works.fetchDetailForDelivery;
-  const byPatient = config.paging.works.fetchDetailsWhenMissingPatient;
-  if (!always && !byPatient) return items;
+/** Motivo para consultar el detalle de esta orden, o null si no hace falta. */
+function detailReason(w: WorkItem, current: WorkState | undefined, sig: string, now: number): string | null {
+  const works = config.paging.works;
+  if (!works.fetchDetailForDelivery) {
+    return works.fetchDetailsWhenMissingPatient && needsWorkDetail(w) ? "sin_paciente" : null;
+  }
+  if (!works.detailOnlyChanged) return "siempre";
+
+  const seen = seenList.get(Number(w.id));
+  if (!current) return "nueva";
+  if (!current.hasDetail) return "sin_detalle";
+  if (seen && seen.sig !== sig) return "cambio_en_listado";
+  if (!current.hasDelivery && (!seen || now - seen.at >= works.openRecheckMinutes * 60_000)) return "abierta";
+  if (works.fetchDetailsWhenMissingPatient && needsWorkDetail(w) && !seen) return "sin_paciente";
+  return null;
+}
+
+// detalles consultados pendientes de guardar en external_work_details
+let saveBuffer: DetailResult[] = [];
+
+async function flushSaves(stats: DetailStats) {
+  if (!saveBuffer.length) return;
+  const batch = saveBuffer;
+  saveBuffer = [];
+  await persistLock(async () => {
+    const t0 = Date.now();
+    await persistDetails(batch);
+    stats.dbSaveMs += Date.now() - t0;
+  });
+}
+
+async function enrichWorksWithDetail(items: WorkItem[], page: number, stats: DetailStats) {
+  const works = config.paging.works;
+  if (!works.fetchDetailForDelivery && !works.fetchDetailsWhenMissingPatient) return items;
 
   const startedAt = Date.now();
   const ids = uniqueNumbers(items.map((w) => (Number.isFinite(Number(w.id)) ? Number(w.id) : null)));
   const state = await loadWorksState(ids);
-  const ttlMs = detailCacheMs();
 
-  let fromCache = 0;
-  type Plan = { w: WorkItem; action: "keep" | "cache" | "fetch"; cached?: CachedDetail };
-  const plans: Plan[] = items.map((w): Plan => {
-    if (!w.id) return { w, action: "keep" };
-    const needPatient = byPatient && needsWorkDetail(w);
-    if (!always) return { w, action: needPatient ? "fetch" : "keep" };
-
-    const cached = detailCache.get(Number(w.id));
-    if (
-      !needPatient &&
-      cached &&
-      ttlMs &&
-      cached.listStatus === cleanText(w.status) &&
-      startedAt - cached.at < ttlMs
-    ) {
-      fromCache += 1;
-      return { w, action: "cache", cached };
-    }
-    return { w, action: "fetch" };
+  type Plan = { w: WorkItem; sig: string; reason: string | null };
+  const plans: Plan[] = items.map((w) => {
+    const sig = listSignature(w);
+    return { w, sig, reason: w.id ? detailReason(w, state.get(Number(w.id)), sig, startedAt) : null };
   });
-
-  const toFetch = plans.filter((p) => p.action === "fetch").length;
-  if (!toFetch && !fromCache) return items;
 
   let fetched = 0;
   let failed = 0;
+  let skipped = 0;
   const toSave: DetailResult[] = [];
-  const concurrency = Math.max(1, config.paging.works.detailConcurrency);
-
-  const enrichedItems = await mapWithConcurrency(plans, concurrency, async (p) => {
-    if (p.action === "keep") return p.w;
-    if (p.action === "cache") return withDetailValues(p.w, p.cached!);
-
+  const enrichedItems = await mapWithConcurrency(plans, plans.length, async (p) => {
     const id = Number(p.w.id);
+    const current = state.get(id);
+
+    if (!p.reason) {
+      skipped += 1;
+      if (id && !seenList.has(id)) seenList.set(id, { sig: p.sig, at: 0 });
+      return works.fetchDetailForDelivery ? withCurrentValues(p.w, current) : p.w;
+    }
+
+    stats.motivos[p.reason] = (stats.motivos[p.reason] ?? 0) + 1;
     try {
-      const detail = await fetchWorkDetail(p.w.id);
+      const detail = await detailLimiter(async () => {
+        const t0 = Date.now();
+        try {
+          return await fetchWorkDetail(p.w.id);
+        } finally {
+          stats.apiMs += Date.now() - t0;
+        }
+      });
       if (!detail?.id) throw new Error("detalle vacio");
       fetched += 1;
+      seenList.set(id, { sig: p.sig, at: Date.now() });
 
-      const values = detailValuesOf(detail);
-      if (ttlMs) detailCache.set(id, { ...values, at: Date.now(), listStatus: cleanText(p.w.status) });
-
-      const current = state.get(id);
       if (current) toSave.push({ ref: { work_id: current.workId, external_id: id }, detail });
-
-      return withDetailValues(p.w, values, detail);
+      return withDetailValues(p.w, detailValuesOf(detail), detail);
     } catch (err: any) {
       failed += 1;
       logger.warn(
         `Works ETL: no pude cargar detalle work_id=${p.w.id} ` +
           `status=${err?.response?.status ?? err?.code ?? err?.message ?? "unknown"}`
       );
-      return always ? withCurrentValues(p.w, state.get(id)) : p.w;
+      return works.fetchDetailForDelivery ? withCurrentValues(p.w, current) : p.w;
     }
   });
 
   // hijo: detalle completo (external_work_details + tareas, productos, tags, lotes)
-  if (toSave.length) await persistDetails(toSave);
+  // [VELOCIDAD] el detalle se junta y se guarda en lotes grandes (WORKS_DETAIL_SAVE_BATCH), de uno en uno
+  if (toSave.length) {
+    saveBuffer.push(...toSave);
+    if (saveBuffer.length >= works.detailSaveBatch) await flushSaves(stats);
+  }
 
-  logger.info(
-    `Works ETL: page=${page} detalles consultados=${fetched}/${toFetch} ` +
-      `guardados en external_work_details=${toSave.length}` +
-      (fromCache ? ` desde cache=${fromCache}` : "") +
-      (failed ? ` failed=${failed}` : "") +
-      ` (${((Date.now() - startedAt) / 1000).toFixed(1)}s)`
-  );
+  stats.consultados += fetched;
+  stats.fallidos += failed;
+  stats.guardados += toSave.length;
+  stats.omitidos += skipped;
+
+  if (failed) {
+    logger.info(
+      `Works ETL: page=${page} detalles consultados=${fetched}` +
+        (failed ? ` failed=${failed}` : "") +
+        ` guardados en external_work_details=${toSave.length} sin cambios=${skipped}` +
+        ` (${((Date.now() - startedAt) / 1000).toFixed(1)}s)`
+    );
+  }
 
   return enrichedItems;
 }
@@ -376,6 +453,9 @@ async function upsertWorksAndPatientsFromStg(context: string) {
   logger.info(`Works ETL: upsert parcial aplicado (${context})`);
 }
 
+// ordenes ya intentadas por el backfill de pacientes -> cuando (en memoria)
+const backfillTried = new Map<number, number>();
+
 async function backfillMissingPatientsFromDetails() {
   if (!config.paging.works.backfillMissingPatients) return;
 
@@ -383,7 +463,7 @@ async function backfillMissingPatientsFromDetails() {
   if (!limit) return;
   const limitSql = Math.trunc(limit);
 
-  const missingWorks = await exec<Array<{ external_id: number }>>(
+  const missingWorksAll = await exec<Array<{ external_id: number }>>(
     `
       SELECT external_id
       FROM works
@@ -395,6 +475,14 @@ async function backfillMissingPatientsFromDetails() {
     `
   );
 
+  // [VELOCIDAD] no volver a intentar en cada vuelta las mismas ordenes (p. ej. las que dan 404)
+  const retryMs = Math.max(0, config.paging.works.backfillRetryHours) * 3_600_000;
+  const nowMs = Date.now();
+  const missingWorks = missingWorksAll.filter(({ external_id }) => {
+    const last = backfillTried.get(Number(external_id));
+    return !last || nowMs - last >= retryMs;
+  });
+  for (const { external_id } of missingWorks) backfillTried.set(Number(external_id), nowMs);
   if (!missingWorks.length) return;
 
   logger.info(
@@ -462,9 +550,35 @@ async function backfillMissingPatientsFromDetails() {
   );
 }
 
+function logProgress(stats: DetailStats, startedAt: number) {
+  const minutes = Math.max((Date.now() - startedAt) / 60000, 1 / 60);
+  const calls = stats.consultados + stats.fallidos;
+  logger.info(
+    `Works ETL: progreso paginas=${stats.paginas} ordenes=${stats.ordenes} ` +
+      `ritmo=${Math.round(stats.ordenes / minutes)} ordenes/min ` +
+      `detalles=${stats.consultados} fallidos=${stats.fallidos} ` +
+      `latencia detalle promedio=${calls ? (stats.apiMs / calls / 1000).toFixed(2) : "0"}s ` +
+      `concurrencia detalle=${config.paging.works.detailConcurrency} ` +
+      `tiempo guardando detalle=${Math.round(stats.dbSaveMs / 1000)}s`
+  );
+}
+
 export async function worksEtl(updatedSince: string) {
   logger.info("Works ETL (STG): start");
-  pruneDetailCache();
+  const runStartedAt = Date.now();
+  const detailStats = newDetailStats();
+  detailLimiter = createLimiter(Math.max(1, config.paging.works.detailConcurrency));
+  persistLock = createLimiter(1);
+  saveBuffer = [];
+
+  // [VELOCIDAD] varias paginas se procesan a la vez (detalle + staging) mientras llegan las siguientes
+  const pageWorkers = Math.max(1, config.paging.works.pageConcurrency);
+  const inProgress = new Set<Promise<void>>();
+  let pageError: unknown = null;
+  const waitPages = async (max: number) => {
+    while (inProgress.size > max) await Promise.race(inProgress);
+    if (pageError) throw pageError;
+  };
 
   // [SPLIT] primero validar que clients/doctors ya existan antes de tocar works
   if (!(await ensureWorkDependenciesReady())) return;
@@ -516,19 +630,41 @@ export async function worksEtl(updatedSince: string) {
         }
       }
 
-      const works = await enrichWorksWithDetail(items, page);
-      await stageWorks(works);
+      const task: Promise<void> = (async () => {
+        const works = await enrichWorksWithDetail(items, page, detailStats);
+        await stageWorks(works);
+      })()
+        .catch((err) => {
+          pageError ??= err;
+        })
+        .finally(() => {
+          inProgress.delete(task);
+          detailStats.paginas += 1;
+          detailStats.ordenes += items.length;
+          if (detailStats.paginas % 20 === 0) logProgress(detailStats, runStartedAt);
+        });
+      inProgress.add(task);
+      await waitPages(pageWorkers - 1);
 
-      if (pagingOnly && (page === pageStart || (page - pageStart + 1) % 100 === 0)) {
+      // [VELOCIDAD] upserts parciales opcionales (WORKS_PARTIAL_UPSERT_EVERY_PAGES; 0 = solo al final)
+      const partialEvery = Math.max(0, Math.trunc(config.paging.works.partialUpsertEveryPages));
+      if (pagingOnly && partialEvery && (page - pageStart + 1) % partialEvery === 0) {
+        await waitPages(0);
         await upsertWorksAndPatientsFromStg(`page=${page}`);
       }
     },
     {
       pageStart,
       label: "Works ETL",
-      delayMs: pagingOnly ? 150 : 0,
+      // [VELOCIDAD] varias paginas del listado a la vez; sin pausa fija entre paginas
+      prefetch: config.paging.works.pageConcurrency,
+      delayMs: config.paging.works.pageDelayMs,
     }
   );
+
+  // terminar las paginas que siguen en proceso y guardar los detalles pendientes
+  await waitPages(0);
+  await flushSaves(detailStats);
 
   const [{ c: stgCount }] = await exec<Array<{ c: number }>>("SELECT COUNT(*) c FROM stg_works");
   logger.info(`Works ETL: stg_works=${stgCount}`);
@@ -574,5 +710,15 @@ export async function worksEtl(updatedSince: string) {
     }
   }
 
+  logger.info(
+    `Works ETL: resumen paginas=${pages.pagesWithItems} ordenes=${pages.totalItems} ` +
+      `detalles consultados=${detailStats.consultados} (${Object.entries(detailStats.motivos)
+        .map(([k, v]) => `${k}=${v}`)
+        .join(" ") || "-"}) fallidos=${detailStats.fallidos} ` +
+      `guardados en external_work_details=${detailStats.guardados} sin cambios=${detailStats.omitidos} ` +
+      `latencia detalle promedio=${detailStats.consultados + detailStats.fallidos ? (detailStats.apiMs / (detailStats.consultados + detailStats.fallidos) / 1000).toFixed(2) : "0"}s ` +
+      `tiempo guardando detalle=${Math.round(detailStats.dbSaveMs / 1000)}s ` +
+      `tiempo total=${Math.round((Date.now() - runStartedAt) / 1000)}s`
+  );
   logger.info("Works ETL (STG): done");
 }

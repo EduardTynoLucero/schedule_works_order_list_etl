@@ -56,7 +56,19 @@ Con `WORKS_FETCH_DETAIL_FOR_DELIVERY=1` cada orden del listado consulta `/works/
   de las ordenes que ya existen en `works`. Las ordenes nuevas las crea el ETL de detalle en su siguiente vuelta.
   `src/etl/detailStore.ts` es copia del guardado del repo `schedule_works_order_details_etl`: si cambias uno, cambia el otro.
 - Si la consulta falla, la orden conserva el status y la fecha que ya tenia en `works`.
-- `WORKS_DETAIL_CACHE_MINUTES` (0 = siempre consulta): minutos sin volver a consultar una orden cuyo status
-  en el listado no cambio.
+
+## Velocidad
+
+Por defecto consulta SIEMPRE el detalle de todas las ordenes (`WORKS_DETAIL_ONLY_CHANGED=0`). Para que sea rapido:
+
+- Se piden `WORKS_PAGE_CONCURRENCY` (8) paginas del listado a la vez y se procesan varias paginas al mismo tiempo,
+  sin pausa fija entre paginas (`WORKS_PAGE_DELAY_MS`=0).
+- `WORKS_DETAIL_CONCURRENCY` = consultas al detalle al mismo tiempo en toda la corrida (default en `.env`: 32).
+  Es lo que mas influye: tiempo aproximado = ordenes x latencia del detalle / concurrencia.
+- El detalle se guarda en `external_work_details` en lotes de `WORKS_DETAIL_SAVE_BATCH` (500), de uno en uno.
+- `WORKS_PARTIAL_UPSERT_EVERY_PAGES` (0): en PAGING_ONLY solo se aplica a `works` al final.
+- Cada 20 paginas: `Works ETL: progreso paginas=... ritmo=N ordenes/min latencia detalle promedio=Xs ...`.
+  Si al subir la concurrencia la latencia promedio tambien sube, la API ya no da mas.
+- `WORKS_DETAIL_ONLY_CHANGED=1` (opcional) consulta solo nuevas, cambiadas en el listado o abiertas.
 
 El log de cada pagina muestra `detalles consultados=X/Y guardados en external_work_details=Z (Ns)`.
