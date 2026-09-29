@@ -94,6 +94,12 @@ export const config = {
       detailConcurrency: toNum(process.env.WORKS_DETAIL_CONCURRENCY, 2),
       backfillMissingPatients: toBool(process.env.WORKS_BACKFILL_MISSING_PATIENTS, false),
       backfillMissingPatientsLimit: toNum(process.env.WORKS_BACKFILL_MISSING_PATIENTS_LIMIT, 500),
+      // WORKS_FIND_EXTERNAL_ID: external_id a buscar (o varios separados por coma).
+      // Al terminar la corrida se imprime en que pagina de la API aparecio.
+      findExternalIds: String(process.env.WORKS_FIND_EXTERNAL_ID ?? "")
+        .split(",")
+        .map((v) => Number(v.trim()))
+        .filter((n) => Number.isFinite(n) && n > 0),
     },
   },
 };

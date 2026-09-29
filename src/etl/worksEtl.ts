@@ -327,11 +327,32 @@ export async function worksEtl(updatedSince: string) {
 
   await backfillMissingPatientsFromDetails();
 
+  // busqueda de WORKS_FIND_EXTERNAL_ID: external_id -> paginas donde aparecio
+  const findIds = new Set(config.paging.works.findExternalIds);
+  const foundIn = new Map<number, Array<{ page: number; code: string | null }>>();
+  if (findIds.size) logger.info(`Works ETL: buscando external_id=${[...findIds].join(",")}`);
+
   const pages = await paginate<WorkItem>(
     async (page) => fetchWorksPageWithMeta(page, sinceParam),
     async (items, page) => {
       logger.info(`Works ETL: page=${page} items=${items.length}`);
       if (!items.length) return;
+
+      // ordenes procesadas en esta pagina: external_id (id de la API) / code
+      logger.info(
+        `Works ETL: page=${page} ordenes (external_id/code): ` +
+          items.map((w) => `${w.id}/${w.code ?? "-"}`).join(", ")
+      );
+
+      if (findIds.size) {
+        for (const w of items) {
+          const id = Number(w.id);
+          if (!findIds.has(id)) continue;
+          const hits = foundIn.get(id) ?? [];
+          hits.push({ page, code: w.code ?? null });
+          foundIn.set(id, hits);
+        }
+      }
 
       const works = await enrichWorksWithDetail(items, page);
       await stageWorks(works);
@@ -374,6 +395,22 @@ export async function worksEtl(updatedSince: string) {
 
   // [SPLIT] completar doctor_id/clinic_id de works que llegaron antes que su doctor/clinica
   await relinkWorkReferences();
+
+  // resultado de la busqueda de WORKS_FIND_EXTERNAL_ID
+  for (const id of findIds) {
+    const hits = foundIn.get(id);
+    if (hits?.length) {
+      logger.info(
+        `Works ETL: BUSQUEDA external_id=${id} -> encontrada en ` +
+          hits.map((h) => `page=${h.page}${h.code ? ` (code=${h.code})` : ""}`).join(", ")
+      );
+    } else {
+      logger.warn(
+        `Works ETL: BUSQUEDA external_id=${id} -> no aparecio en ninguna pagina ` +
+          `(recorridas ${pages.pageStart}..${pages.lastPage ?? "-"}, mode=${pagingOnly ? "PAGING_ONLY" : "UPDATED_SINCE"})`
+      );
+    }
+  }
 
   logger.info("Works ETL (STG): done");
 }

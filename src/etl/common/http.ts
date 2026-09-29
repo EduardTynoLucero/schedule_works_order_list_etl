@@ -1,4 +1,6 @@
 import axios from "axios";
+import { Agent as HttpAgent } from "node:http";
+import { Agent as HttpsAgent } from "node:https";
 import { config } from "../../config.js";
 import { logger } from "./logger.js";
 
@@ -24,9 +26,15 @@ function isRetryableHttpError(error: any) {
   );
 }
 
+// [VELOCIDAD] Reutiliza las conexiones a la API (keep-alive). En Node 18 (el que usa Dokploy/Nixpacks)
+// no viene activado por defecto y cada consulta abria una conexion HTTPS nueva (handshake TLS).
+const keepAlive = { keepAlive: true, maxSockets: 32, maxFreeSockets: 16 };
+
 export const http = axios.create({
   baseURL: config.api.baseUrl,
   timeout: 60000,
+  httpAgent: new HttpAgent(keepAlive),
+  httpsAgent: new HttpsAgent(keepAlive),
   headers: {
     Accept: "application/json",
     "Content-Type": "application/json",

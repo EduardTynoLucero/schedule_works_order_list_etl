@@ -43,3 +43,12 @@ El ETL pide paginas desde `*_PAGE_FROM` (default 0) hasta que la API ya no devue
 - El pool esta acotado: `DB_POOL_LIMIT` (5), `DB_POOL_MAX_IDLE` (2, las demas se cierran a los 60s) y
   `DB_MAX_PREPARED_STATEMENTS` (50).
 - Con `ETL_RUN_ONCE=1` el pool se cierra al terminar, asi el proceso sale solo. Con SIGINT/SIGTERM tambien se cierra.
+
+## estimated_delivery en works
+
+Al guardar en `works`, `estimated_delivery` toma, en este orden:
+1. `external_work_details.delivery_note_date` (fecha de envio, si el ETL de detalle ya la trajo),
+2. el `estimated_delivery` del listado,
+3. el `estimated_delivery` del detalle (cuando el listado viene NULL).
+
+Nunca reemplaza una fecha existente por NULL. Este ETL no consulta `/works/{id}` para esto: lo hace el ETL de detalle.

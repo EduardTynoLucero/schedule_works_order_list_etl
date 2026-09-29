@@ -58,7 +58,8 @@ export const SQL = {
     s.box,
     s.created_at_api,
     s.accepted_date,
-    s.estimated_delivery,
+    -- fecha de envio del detalle si ya existe; si no, la del listado; si viene NULL, la estimada del detalle
+    COALESCE(ewd.delivery_note_date, s.estimated_delivery, ewd.estimated_delivery),
     s.finish_date,
     s.status,
     s.status_name,
@@ -72,6 +73,8 @@ export const SQL = {
     COALESCE(p_key.patient_id, p_name.patient_id),
     1, 0, NOW(), 'etl', NOW(), 'etl'
   FROM stg_works s
+  LEFT JOIN external_work_details ewd
+    ON ewd.work_external_id = s.external_id
   LEFT JOIN clients c
     ON c.external_id = s.clinic_external_id
   LEFT JOIN doctors d
@@ -103,7 +106,8 @@ export const SQL = {
     box = VALUES(box),
     created_at_api = VALUES(created_at_api),
     accepted_date = VALUES(accepted_date),
-    estimated_delivery = VALUES(estimated_delivery),
+    -- nunca reemplazar una fecha por NULL
+    estimated_delivery = COALESCE(VALUES(estimated_delivery), works.estimated_delivery),
     finish_date = VALUES(finish_date),
     status = VALUES(status),
     status_name = VALUES(status_name),
