@@ -92,6 +92,10 @@ export const config = {
       pageFrom: toNum(process.env.WORKS_PAGE_FROM, 0),
       fetchDetailsWhenMissingPatient: toBool(process.env.WORKS_FETCH_DETAILS_WHEN_MISSING_PATIENT, false),
       detailConcurrency: toNum(process.env.WORKS_DETAIL_CONCURRENCY, 2),
+      // [ENVIO] consultar SIEMPRE /works/{id}: status, status_name y fecha de envio (delivery_note_date) del detalle
+      fetchDetailForDelivery: toBool(process.env.WORKS_FETCH_DETAIL_FOR_DELIVERY, true),
+      // minutos sin volver a consultar la misma orden si su status en el listado no cambio (0 = siempre)
+      detailCacheMinutes: toNum(process.env.WORKS_DETAIL_CACHE_MINUTES, 0),
       backfillMissingPatients: toBool(process.env.WORKS_BACKFILL_MISSING_PATIENTS, false),
       backfillMissingPatientsLimit: toNum(process.env.WORKS_BACKFILL_MISSING_PATIENTS_LIMIT, 500),
       // WORKS_FIND_EXTERNAL_ID: external_id a buscar (o varios separados por coma).

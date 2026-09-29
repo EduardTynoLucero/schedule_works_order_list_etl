@@ -44,11 +44,19 @@ El ETL pide paginas desde `*_PAGE_FROM` (default 0) hasta que la API ya no devue
   `DB_MAX_PREPARED_STATEMENTS` (50).
 - Con `ETL_RUN_ONCE=1` el pool se cierra al terminar, asi el proceso sale solo. Con SIGINT/SIGTERM tambien se cierra.
 
-## estimated_delivery en works
+## Fecha de envio y estado: siempre desde el detalle
 
-Al guardar en `works`, `estimated_delivery` toma, en este orden:
-1. `external_work_details.delivery_note_date` (fecha de envio, si el ETL de detalle ya la trajo),
-2. el `estimated_delivery` del listado,
-3. el `estimated_delivery` del detalle (cuando el listado viene NULL).
+Con `WORKS_FETCH_DETAIL_FOR_DELIVERY=1` cada orden del listado consulta `/works/{id}`
+(`WORKS_DETAIL_CONCURRENCY` consultas simultaneas) y:
 
-Nunca reemplaza una fecha existente por NULL. Este ETL no consulta `/works/{id}` para esto: lo hace el ETL de detalle.
+- **works (padre):** `status` y `status_name` del detalle; `estimated_delivery` = `delivery_note_date`
+  (fecha de envio; NULL si la orden aun no se envia). Las demas fechas son las del listado.
+  Paciente, clinica y doctor del detalle solo si el listado no los trae.
+- **external_work_details (hijo):** se guarda el detalle completo (tambien tareas, productos, tags y lotes)
+  de las ordenes que ya existen en `works`. Las ordenes nuevas las crea el ETL de detalle en su siguiente vuelta.
+  `src/etl/detailStore.ts` es copia del guardado del repo `schedule_works_order_details_etl`: si cambias uno, cambia el otro.
+- Si la consulta falla, la orden conserva el status y la fecha que ya tenia en `works`.
+- `WORKS_DETAIL_CACHE_MINUTES` (0 = siempre consulta): minutos sin volver a consultar una orden cuyo status
+  en el listado no cambio.
+
+El log de cada pagina muestra `detalles consultados=X/Y guardados en external_work_details=Z (Ns)`.
