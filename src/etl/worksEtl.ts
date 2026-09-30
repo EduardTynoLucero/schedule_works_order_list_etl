@@ -781,10 +781,8 @@ export async function worksEtl(updatedSince: string) {
 
   });
 
-  // [SPLIT] completar doctor_id/clinic_id de works que llegaron antes que su doctor/clinica
-  await relinkWorkReferences();
 
-  // resultado de la busqueda de WORKS_FIND_EXTERNAL_ID
+  await relinkWorkReferences();
   for (const id of findIds) {
     const hits = foundIn.get(id);
     if (hits?.length) {
