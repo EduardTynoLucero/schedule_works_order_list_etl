@@ -58,6 +58,7 @@ export const SQL = {
     s.box,
     s.created_at_api,
     s.accepted_date,
+    -- [ENVIO] = delivery_note_date del detalle (lo calcula el ETL); NULL si la orden aun no se envia
     s.estimated_delivery,
     s.finish_date,
     s.status,

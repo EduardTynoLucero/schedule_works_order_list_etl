@@ -92,8 +92,33 @@ export const config = {
       pageFrom: toNum(process.env.WORKS_PAGE_FROM, 0),
       fetchDetailsWhenMissingPatient: toBool(process.env.WORKS_FETCH_DETAILS_WHEN_MISSING_PATIENT, false),
       detailConcurrency: toNum(process.env.WORKS_DETAIL_CONCURRENCY, 2),
+      // [ADAPTATIVO] 1 (default) = WORKS_DETAIL_CONCURRENCY es el MAXIMO: arranca en 8, sube sola mientras la API
+      // responde bien y baja a la mitad si responde 503/429/timeout. 0 = siempre fija en WORKS_DETAIL_CONCURRENCY
+      detailAdaptive: toBool(process.env.WORKS_DETAIL_ADAPTIVE, true),
+      // [ENVIO] consultar SIEMPRE /works/{id}: status, status_name y fecha de envio (delivery_note_date) del detalle
+      fetchDetailForDelivery: toBool(process.env.WORKS_FETCH_DETAIL_FOR_DELIVERY, true),
+      // 0 (default) = consultar SIEMPRE el detalle de todas las ordenes; 1 = solo nuevas, cambiadas o abiertas
+      detailOnlyChanged: toBool(process.env.WORKS_DETAIL_ONLY_CHANGED, false),
+      // ordenes abiertas (sin fecha de envio): volver a consultar su detalle como maximo cada N minutos
+      openRecheckMinutes: Math.max(0, toNum(process.env.WORKS_OPEN_RECHECK_MINUTES, 30)),
+      // paginas del listado pedidas a la vez
+      pageConcurrency: Math.max(1, toNum(process.env.WORKS_PAGE_CONCURRENCY, 8)),
+      // [VELOCIDAD] detalles que se juntan antes de guardarlos en external_work_details (una transaccion)
+      detailSaveBatch: Math.max(1, toNum(process.env.WORKS_DETAIL_SAVE_BATCH, 500)),
+      // pausa entre paginas (antes 150 ms fijos en PAGING_ONLY)
+      pageDelayMs: Math.max(0, toNum(process.env.WORKS_PAGE_DELAY_MS, 0)),
+      // PAGING_ONLY: aplicar a works cada N paginas (0 = solo al final)
+      partialUpsertEveryPages: Math.max(0, toNum(process.env.WORKS_PARTIAL_UPSERT_EVERY_PAGES, 0)),
+      // backfill de pacientes: no reintentar la misma orden antes de N horas
+      backfillRetryHours: Math.max(0, toNum(process.env.WORKS_BACKFILL_RETRY_HOURS, 6)),
       backfillMissingPatients: toBool(process.env.WORKS_BACKFILL_MISSING_PATIENTS, false),
       backfillMissingPatientsLimit: toNum(process.env.WORKS_BACKFILL_MISSING_PATIENTS_LIMIT, 500),
+      // WORKS_FIND_EXTERNAL_ID: external_id a buscar (o varios separados por coma).
+      // Al terminar la corrida se imprime en que pagina de la API aparecio.
+      findExternalIds: String(process.env.WORKS_FIND_EXTERNAL_ID ?? "")
+        .split(",")
+        .map((v) => Number(v.trim()))
+        .filter((n) => Number.isFinite(n) && n > 0),
     },
   },
 };

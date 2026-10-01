@@ -65,12 +65,33 @@ export async function paginate<T>(
     pageMax?: number;
     delayMs?: number;
     label?: string;
+    /** [VELOCIDAD] paginas pedidas a la API al mismo tiempo (se procesan en orden). Default 1. */
+    prefetch?: number;
   }
 ): Promise<PaginateSummary> {
   const pageStart = opts?.pageStart ?? 0;
   const pageMax = opts?.pageMax ?? Number.POSITIVE_INFINITY;
   const delayMs = opts?.delayMs ?? 0;
   const label = opts?.label ?? "Paginacion";
+  const prefetch = Math.max(1, Math.trunc(opts?.prefetch ?? 1));
+
+  // [VELOCIDAD] se piden hasta `prefetch` paginas por adelantado; se procesan una por una en orden.
+  // Cada promesa ya trae su error envuelto, asi las que sobran al terminar no generan "unhandled rejection".
+  type Fetched = { ok: true; res: ApiPage<T> | T[] } | { ok: false; err: any };
+  const inflight = new Map<number, Promise<Fetched>>();
+  let nextToLaunch = pageStart;
+  const launch = () => {
+    while (inflight.size < prefetch && nextToLaunch <= pageMax) {
+      const p = nextToLaunch++;
+      inflight.set(
+        p,
+        fetchPage(p).then(
+          (res): Fetched => ({ ok: true, res }),
+          (err): Fetched => ({ ok: false, err })
+        )
+      );
+    }
+  };
 
   const seen = new Map<string, number>();
   let lastPage: number | null = null;
@@ -82,10 +103,16 @@ export async function paginate<T>(
   let stopReason: PaginateStopReason = "page_max";
 
   for (let page = pageStart; page <= pageMax; page++) {
+    launch();
+    const fetched = await inflight.get(page)!;
+    inflight.delete(page);
+    launch(); // mantener la ventana llena mientras se procesa esta pagina
+
     let res: ApiPage<T> | T[];
-    try {
-      res = await fetchPage(page);
-    } catch (err: any) {
+    if (fetched.ok) {
+      res = fetched.res;
+    } else {
+      const err = fetched.err;
       if (err?.response?.status === 404 && pagesWithItems > 0) {
         logger.warn(`${label}: page=${page} respondio 404, se toma como fin de paginas.`);
         stopReason = "http_404";
