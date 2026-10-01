@@ -30,9 +30,15 @@ function networkReason(error: any): string | null {
 // 502/504/timeout pueden ser de una orden puntual (p. ej. un detalle que siempre truena): si esa consulta falla
 // GIVE_UP_TRIES veces mientras la API SI responde a otras, se deja de reintentar para no trabar el ETL.
 const GIVE_UP_TRIES = 10;
+// Las paginas del listado (/works sin id) nunca se abandonan: si se pierde una pagina se cae toda la vuelta.
+function isListRequest(url: unknown) {
+  return !/\/\d+\/?$/.test(String(url ?? ""));
+}
 function neverGiveUp(error: any) {
   const status = error?.response?.status;
-  return status === 429 || status === 503 || Boolean(networkReason(error));
+  return (
+    status === 429 || status === 503 || Boolean(networkReason(error)) || isListRequest(error?.config?.url)
+  );
 }
 
 // [ADAPTATIVO] avisa cuando la API responde que esta saturada, para que el ETL baje solo la cantidad de
@@ -75,8 +81,9 @@ function pauseApi(reason: string, sentAt: number) {
   );
 }
 
-async function waitWhilePaused() {
-  while (Date.now() < pausedUntil) await sleep(pausedUntil - Date.now());
+async function waitWhilePaused(signal?: AbortSignal) {
+  // si la vuelta se cancela durante la pausa, no se sigue esperando (axios cancela la consulta al salir)
+  while (Date.now() < pausedUntil && !signal?.aborted) await sleep(Math.min(500, pausedUntil - Date.now()));
 }
 
 // [VELOCIDAD] Reutiliza las conexiones a la API (keep-alive). En Node 18 (el que usa Dokploy/Nixpacks)
@@ -103,7 +110,7 @@ export const http = axios.create({
 
 // [SATURACION] ninguna consulta sale mientras dure una pausa por saturacion
 http.interceptors.request.use(async (requestConfig) => {
-  await waitWhilePaused();
+  await waitWhilePaused(requestConfig.signal as AbortSignal | undefined);
   (requestConfig as any).__sentAt = Date.now();
   return requestConfig;
 });
@@ -116,6 +123,8 @@ http.interceptors.response.use(
   },
   async (error) => {
     const requestConfig = error?.config;
+    // [SATURACION] consulta de una vuelta cancelada (fallo o ya termino): no se reintenta
+    if (requestConfig?.signal?.aborted) throw error;
     const overload = overloadReason(error);
     const reason = overload ?? networkReason(error);
     if (!requestConfig || !reason) throw error;

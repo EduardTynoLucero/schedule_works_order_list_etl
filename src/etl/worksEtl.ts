@@ -2,7 +2,7 @@ import { logger } from "./common/logger.js";
 import { createHash } from "node:crypto";
 import { exec, execQuery } from "../db.js";
 import { cleanText, persistDetails, toMysqlDate, uniqueNumbers, type DetailResult } from "./detailStore.js";
-import { paginate } from "./common/pagination.js";
+import { paginate, type PaginateSummary } from "./common/pagination.js";
 import { bulkInsert } from "./common/bulkInsert.js";
 import { withTx } from "./common/tx.js";
 import { SQL } from "./common/sql.js";
@@ -178,6 +178,8 @@ function createAdaptiveLimiter(max: number, adaptive: boolean) {
 let detailLimiter = createAdaptiveLimiter(1, false);
 onApiOverload((reason, sentAt) => detailLimiter.overload(reason, sentAt));
 let persistLock = createLimiter(1);
+// [SATURACION] cancela las consultas a la API de la vuelta actual (si falla, o lo que sobra al terminar)
+let runAbort = new AbortController();
 
 async function mapWithConcurrency<T, R>(
   items: T[],
@@ -409,7 +411,7 @@ async function enrichWorksWithDetail(items: WorkItem[], page: number, stats: Det
       const detail = await detailLimiter.run(async () => {
         const t0 = Date.now();
         try {
-          return await fetchWorkDetail(p.w.id);
+          return await fetchWorkDetail(p.w.id, runAbort.signal);
         } finally {
           stats.apiMs += Date.now() - t0;
         }
@@ -422,7 +424,7 @@ async function enrichWorksWithDetail(items: WorkItem[], page: number, stats: Det
       return withDetailValues(p.w, detailValuesOf(detail), detail);
     } catch (err: any) {
       failed += 1;
-      logger.warn(
+      if (!runAbort.signal.aborted) logger.warn(
         `Works ETL: no pude cargar detalle work_id=${p.w.id} ` +
           `status=${err?.response?.status ?? err?.code ?? err?.message ?? "unknown"}`
       );
@@ -585,12 +587,12 @@ async function backfillMissingPatientsFromDetails() {
     Math.max(1, config.paging.works.detailConcurrency),
     async ({ external_id }) => {
       try {
-        const detail = await detailLimiter.run(() => fetchWorkDetail(external_id));
+        const detail = await detailLimiter.run(() => fetchWorkDetail(external_id, runAbort.signal));
         if (detail && patientName(detail)?.trim()) fetched += 1;
         return detail;
       } catch (err: any) {
         failed += 1;
-        logger.warn(
+        if (!runAbort.signal.aborted) logger.warn(
           `Works ETL: no pude cargar detalle faltante work_id=${external_id} ` +
             `status=${err?.response?.status ?? err?.code ?? err?.message ?? "unknown"}`
         );
@@ -660,6 +662,9 @@ export async function worksEtl(updatedSince: string) {
   persistLock = createLimiter(1);
   saveBuffer = [];
   resetApiPauseStats();
+  runAbort.abort(); // por si quedo algo de una vuelta anterior
+  runAbort = new AbortController();
+  const signal = runAbort.signal;
 
   // [VELOCIDAD] varias paginas se procesan a la vez (detalle + staging) mientras llegan las siguientes
   const pageWorkers = Math.max(1, config.paging.works.pageConcurrency);
@@ -681,7 +686,7 @@ export async function worksEtl(updatedSince: string) {
 
   // base 0/1 solo importa en snapshot
   let base = 0;
-  if (pagingOnly) base = await detectPageBase((p) => fetchWorksPage(p, null));
+  if (pagingOnly) base = await detectPageBase((p) => fetchWorksPage(p, null, signal));
 
   const pageStart = pagingOnly ? (config.paging.works.pageFrom + base) : 0;
   // sin pagina final quemada: la API indica cuando ya no hay mas
@@ -698,63 +703,76 @@ export async function worksEtl(updatedSince: string) {
   const foundIn = new Map<number, Array<{ page: number; code: string | null }>>();
   if (findIds.size) logger.info(`Works ETL: buscando external_id=${[...findIds].join(",")}`);
 
-  const pages = await paginate<WorkItem>(
-    async (page) => fetchWorksPageWithMeta(page, sinceParam),
-    async (items, page) => {
-      logger.info(`Works ETL: page=${page} items=${items.length}`);
-      if (!items.length) return;
+  let pages: PaginateSummary;
+  try {
+    pages = await paginate<WorkItem>(
+      async (page) => fetchWorksPageWithMeta(page, sinceParam, signal),
+      async (items, page) => {
+        logger.info(`Works ETL: page=${page} items=${items.length}`);
+        if (!items.length) return;
 
-      // ordenes procesadas en esta pagina: external_id (id de la API) / code
-      logger.info(
-        `Works ETL: page=${page} ordenes (external_id/code): ` +
-          items.map((w) => `${w.id}/${w.code ?? "-"}`).join(", ")
-      );
+        // ordenes procesadas en esta pagina: external_id (id de la API) / code
+        logger.info(
+          `Works ETL: page=${page} ordenes (external_id/code): ` +
+            items.map((w) => `${w.id}/${w.code ?? "-"}`).join(", ")
+        );
 
-      if (findIds.size) {
-        for (const w of items) {
-          const id = Number(w.id);
-          if (!findIds.has(id)) continue;
-          const hits = foundIn.get(id) ?? [];
-          hits.push({ page, code: w.code ?? null });
-          foundIn.set(id, hits);
+        if (findIds.size) {
+          for (const w of items) {
+            const id = Number(w.id);
+            if (!findIds.has(id)) continue;
+            const hits = foundIn.get(id) ?? [];
+            hits.push({ page, code: w.code ?? null });
+            foundIn.set(id, hits);
+          }
         }
+
+        const task: Promise<void> = (async () => {
+          const works = await enrichWorksWithDetail(items, page, detailStats);
+          await stageWorks(works);
+        })()
+          .catch((err) => {
+            pageError ??= err;
+          })
+          .finally(() => {
+            inProgress.delete(task);
+            detailStats.paginas += 1;
+            detailStats.ordenes += items.length;
+            if (detailStats.paginas % 20 === 0) logProgress(detailStats, runStartedAt);
+          });
+        inProgress.add(task);
+        await waitPages(pageWorkers - 1);
+
+        // [VELOCIDAD] upserts parciales opcionales (WORKS_PARTIAL_UPSERT_EVERY_PAGES; 0 = solo al final)
+        const partialEvery = Math.max(0, Math.trunc(config.paging.works.partialUpsertEveryPages));
+        if (pagingOnly && partialEvery && (page - pageStart + 1) % partialEvery === 0) {
+          await waitPages(0);
+          await upsertWorksAndPatientsFromStg(`page=${page}`);
+        }
+      },
+      {
+        pageStart,
+        label: "Works ETL",
+        // [VELOCIDAD] varias paginas del listado a la vez; sin pausa fija entre paginas
+        prefetch: config.paging.works.pageConcurrency,
+        delayMs: config.paging.works.pageDelayMs,
       }
+    );
 
-      const task: Promise<void> = (async () => {
-        const works = await enrichWorksWithDetail(items, page, detailStats);
-        await stageWorks(works);
-      })()
-        .catch((err) => {
-          pageError ??= err;
-        })
-        .finally(() => {
-          inProgress.delete(task);
-          detailStats.paginas += 1;
-          detailStats.ordenes += items.length;
-          if (detailStats.paginas % 20 === 0) logProgress(detailStats, runStartedAt);
-        });
-      inProgress.add(task);
-      await waitPages(pageWorkers - 1);
-
-      // [VELOCIDAD] upserts parciales opcionales (WORKS_PARTIAL_UPSERT_EVERY_PAGES; 0 = solo al final)
-      const partialEvery = Math.max(0, Math.trunc(config.paging.works.partialUpsertEveryPages));
-      if (pagingOnly && partialEvery && (page - pageStart + 1) % partialEvery === 0) {
-        await waitPages(0);
-        await upsertWorksAndPatientsFromStg(`page=${page}`);
-      }
-    },
-    {
-      pageStart,
-      label: "Works ETL",
-      // [VELOCIDAD] varias paginas del listado a la vez; sin pausa fija entre paginas
-      prefetch: config.paging.works.pageConcurrency,
-      delayMs: config.paging.works.pageDelayMs,
-    }
-  );
-
-  // terminar las paginas que siguen en proceso y guardar los detalles pendientes
-  await waitPages(0);
-  await flushSaves(detailStats);
+    // terminar las paginas que siguen en proceso y guardar los detalles pendientes
+    await waitPages(0);
+    await flushSaves(detailStats);
+  } catch (err) {
+    // [SATURACION] la vuelta fallo: se cancelan sus consultas pendientes a la API y se espera a que paren, para que
+    // no sigan cargando la API (ni escribiendo en STG) mientras arranca la siguiente vuelta
+    runAbort.abort();
+    await Promise.allSettled([...inProgress]);
+    await flushSaves(detailStats).catch(() => undefined); // los detalles que si llegaron se guardan
+    throw err;
+  } finally {
+    // lo que sobre (p. ej. paginas pedidas por adelantado despues de la ultima) se cancela
+    runAbort.abort();
+  }
 
   const [{ c: stgCount }] = await exec<Array<{ c: number }>>("SELECT COUNT(*) c FROM stg_works");
   logger.info(`Works ETL: stg_works=${stgCount}`);

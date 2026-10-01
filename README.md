@@ -75,6 +75,9 @@ Por defecto consulta SIEMPRE el detalle de todas las ordenes (`WORKS_DETAIL_ONLY
   esperan Xs`), y cada consulta se reintenta SIN LIMITE de intentos hasta que la API responda. Solo se deja de
   reintentar una consulta con 502/504/timeout que falla 10 veces mientras la API si responde a las demas (una orden
   puntual con problema), para no trabar el ETL; esa orden conserva lo que ya tenia en la base de datos.
+- Las paginas del listado (`/works?page=N`) nunca se dejan de reintentar (si se pierde una, se cae toda la vuelta).
+- Si una vuelta falla, sus consultas pendientes a la API se cancelan y se espera a que paren antes de terminar, para
+  que no sigan cargando la API mientras arranca la siguiente vuelta (1 minuto despues).
 - El detalle se guarda en `external_work_details` en lotes de `WORKS_DETAIL_SAVE_BATCH` (500), de uno en uno.
 - `WORKS_PARTIAL_UPSERT_EVERY_PAGES` (0): en PAGING_ONLY solo se aplica a `works` al final.
 - Cada 20 paginas: `Works ETL: progreso paginas=... ritmo=N ordenes/min latencia detalle promedio=Xs ...`.
